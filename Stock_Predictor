@@ -1,0 +1,297 @@
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import xgboost as xgb
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import accuracy_score, confusion_matrix
+import matplotlib.pyplot as plt
+
+class StockPredictor:
+    def __init__(self, symbol, period='2y'):
+        self.symbol = symbol
+        self.period = period
+        self.data = None
+        self.features = None
+        self.target = None
+        self.model = None
+        
+    def get_stock_data(self):
+        print(f"Getting data for {self.symbol}...")
+        try:
+            ticker = yf.Ticker(self.symbol)
+            self.data = ticker.history(period=self.period)
+            print(f"Got {len(self.data)} days of data")
+            return True
+        except Exception as e:
+            print(f"Error: {e}")
+            return False
+    
+    def add_indicators(self):
+        """Add technical indicators"""
+        df = self.data.copy()
+        
+        # Basic stuff
+        df['price_change'] = df['Close'].pct_change()
+        df['high_low_ratio'] = df['High'] / df['Low']
+        
+        # Moving averages are important for trends
+        for days in [5, 20, 50]:
+            df[f'ma_{days}'] = df['Close'].rolling(days).mean()
+            df[f'price_vs_ma_{days}'] = df['Close'] / df[f'ma_{days}']
+        
+        # RSI calculation
+        delta = df['Close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # MACD
+        ema12 = df['Close'].ewm(span=12).mean()
+        ema26 = df['Close'].ewm(span=26).mean()
+        df['macd'] = ema12 - ema26
+        df['macd_signal'] = df['macd'].ewm(span=9).mean()
+        
+        # Volume indicators
+        df['volume_avg'] = df['Volume'].rolling(20).mean()
+        df['volume_ratio'] = df['Volume'] / df['volume_avg']
+        
+        self.data = df
+    
+    def find_patterns(self):
+        """Look for candlestick patterns"""
+        df = self.data.copy()
+        
+        # Calculate candle parts
+        df['body'] = abs(df['Close'] - df['Open'])
+        df['upper_shadow'] = df['High'] - df[['Close', 'Open']].max(axis=1)
+        df['lower_shadow'] = df[['Close', 'Open']].min(axis=1) - df['Low']
+        
+        # Simple patterns
+        df['doji'] = (df['body'] / (df['High'] - df['Low']) < 0.1).astype(int)
+        df['hammer'] = ((df['lower_shadow'] > 2 * df['body']) & 
+                       (df['upper_shadow'] < df['body'])).astype(int)
+        
+        # Simple green and red candle detection
+        df['green_candle'] = (df['Close'] > df['Open']).astype(int)
+        df['red_candle'] = (df['Close'] < df['Open']).astype(int)
+        
+        # Big green/red candles
+        avg_body = df['body'].rolling(20).mean()
+        df['big_green'] = ((df['Close'] > df['Open']) & 
+                          (df['body'] > 1.5 * avg_body)).astype(int)
+        df['big_red'] = ((df['Close'] < df['Open']) & 
+                        (df['body'] > 1.5 * avg_body)).astype(int)
+        
+        # Count bullish patterns
+        df['bull_patterns'] = df['hammer'] + df['green_candle']
+        
+        self.data = df
+    
+    def prepare_data(self):
+        """Get data ready for ML"""
+        df = self.data.copy()
+        
+        # Target: will price go up tomorrow?
+        df['next_return'] = df['Close'].shift(-1) / df['Close'] - 1
+        df['target'] = (df['next_return'] > 0).astype(int)
+        
+        # Features to use
+        feature_list = [
+            'rsi', 'macd', 'macd_signal', 'volume_ratio',
+            'price_vs_ma_5', 'price_vs_ma_20', 'price_vs_ma_50',
+            'doji', 'hammer', 'green_candle', 'red_candle', 'big_green', 'big_red',
+            'bull_patterns', 'high_low_ratio'
+        ]
+        
+        # Clean up data
+        df_clean = df.dropna()
+        
+        self.features = df_clean[feature_list]
+        self.target = df_clean['target']
+        
+        print(f"Using {len(feature_list)} features with {len(df_clean)} samples")
+    
+    def train_model(self):
+        """Train the XGBoost model"""
+        print("Training model...")
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            self.features, self.target, 
+            test_size=0.2, 
+            random_state=42
+        )
+        
+        print(f"Training: {len(X_train)}, Testing: {len(X_test)}")
+        
+        # Create XGBoost model
+        self.model = xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42
+        )
+        
+        # Train it
+        self.model.fit(X_train, y_train)
+        
+        # Test accuracy
+        predictions = self.model.predict(X_test)
+        accuracy = accuracy_score(y_test, predictions)
+        
+        print(f"Accuracy: {accuracy:.1%}")
+        
+        # Cross validation - test model on different data splits
+        cv_scores = cross_val_score(self.model, X_train, y_train, cv=5)
+        print(f"Cross validation: {cv_scores.mean():.1%}")
+        
+        # Show what's important
+        importances = self.model.feature_importances_
+        feature_names = self.features.columns
+        
+        print("\nTop 5 most important features:")
+        # Get feature importance pairs and sort them
+        feature_importance_pairs = list(zip(feature_names, importances))
+        feature_importance_pairs.sort(key=lambda x: x[1], reverse=True)
+        
+        # Show top 5
+        for i, (name, importance) in enumerate(feature_importance_pairs[:5]):
+            print(f"  {name}: {importance:.3f}")
+        
+        return X_test, y_test, predictions
+    
+    def make_charts(self, X_test, y_test, y_pred):
+        """Create some charts"""
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        
+        # Confusion matrix
+        cm = confusion_matrix(y_test, y_pred)
+        axes[0, 0].imshow(cm, cmap='Blues')
+        axes[0, 0].set_title('Confusion Matrix')
+        axes[0, 0].set_xlabel('Predicted')
+        axes[0, 0].set_ylabel('Actual')
+        
+        # Set tick labels to show DOWN/UP
+        axes[0, 0].set_xticks([0, 1])
+        axes[0, 0].set_xticklabels(['DOWN', 'UP'])
+        axes[0, 0].set_yticks([0, 1])
+        axes[0, 0].set_yticklabels(['DOWN', 'UP'])
+        
+        # Add numbers to confusion matrix
+        for i in range(2):
+            for j in range(2):
+                axes[0, 0].text(j, i, cm[i, j], ha='center', va='center')
+        
+        # Price chart
+        axes[0, 1].plot(self.data.tail(60).index, self.data.tail(60)['Close'], label='Price')
+        axes[0, 1].plot(self.data.tail(60).index, self.data.tail(60)['ma_20'], label='20-day MA')
+        axes[0, 1].set_title(f'{self.symbol} Price')
+        axes[0, 1].legend()
+        
+        # Feature importance
+        importances = self.model.feature_importances_
+        featureNames = self.features.columns
+        
+        # Get top 5 features
+        featureImportance = []
+        for i, name in enumerate(featureNames):
+            featureImportance.append((name, importances[i]))
+        
+        # Sort by importance - most important first
+        def getImportanceValue(featurePair):
+            return featurePair[1]  # Return the importance score
+        
+        featureImportance.sort(key=getImportanceValue, reverse=True)
+        top5 = featureImportance[:5]
+        
+        # Separate names and values for plotting
+        names = []
+        values = []
+        for name, value in top5:
+            names.append(name)
+            values.append(value)
+        
+        axes[1, 0].barh(range(len(names)), values)
+        axes[1, 0].set_yticks(range(len(names)))
+        axes[1, 0].set_yticklabels(names)
+        axes[1, 0].set_title('Top 5 Important Features')
+        
+        # RSI
+        axes[1, 1].plot(self.data.tail(60).index, self.data.tail(60)['rsi'])
+        axes[1, 1].axhline(70, color='red', linestyle='--', label='Overbought')
+        axes[1, 1].axhline(30, color='green', linestyle='--', label='Oversold')
+        axes[1, 1].set_title('RSI')
+        axes[1, 1].legend()
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def predict(self):
+        """Make prediction for tomorrow"""
+        if self.model is None:
+            print("Need to train model first!")
+            return None
+        
+        # Get latest data
+        latest = self.features.iloc[-1:].values
+        
+        # Make prediction
+        pred = self.model.predict(latest)[0]
+        prob = self.model.predict_proba(latest)[0]
+        
+        direction = "UP" if pred == 1 else "DOWN"
+        confidence = max(prob) * 100
+        
+        current_price = self.data['Close'].iloc[-1]
+        
+        print(f"\nPrediction: {direction}")
+        print(f"Confidence: {confidence:.1f}%")
+        print(f"Current price: ${current_price:.2f}")
+        
+        return {
+            'direction': direction,
+            'confidence': confidence,
+            'price': current_price
+        }
+    
+    def run_analysis(self):
+        """Run the whole thing"""
+        print(f"=== Analyzing {self.symbol} ===")
+        
+        if not self.get_stock_data():
+            return None
+        
+        print("Adding technical indicators...")
+        self.addIndicators()
+        
+        print("Looking for patterns...")
+        self.findPatterns()
+        
+        print("Preparing data...")
+        self.prepareData()
+        
+        X_test, y_test, y_pred = self.train_model()
+        
+        print("Creating charts...")
+        self.make_charts(X_test, y_test, y_pred)
+        
+        result = self.predict()
+        
+        print("\nDone!")
+        return result
+
+
+def main():
+    # Get stock from user
+    stock = input("Enter stock symbol: ").upper().strip()
+    
+    # Run analysis
+    predictor = StockPredictor(stock)
+    result = predictor.run_analysis()
+    
+    if not result:
+        print("Analysis failed.")
+
+if __name__ == "__main__":
+    main()
