@@ -263,13 +263,13 @@ class StockPredictor:
             return None
         
         print("Adding technical indicators...")
-        self.addIndicators()
+        self.add_indicators()
         
         print("Looking for patterns...")
-        self.findPatterns()
+        self.find_patterns()
         
         print("Preparing data...")
-        self.prepareData()
+        self.prepare_data()
         
         X_test, y_test, y_pred = self.train_model()
         
